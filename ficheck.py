@@ -3,10 +3,11 @@
 
     Author: Jim Clausing <jclausing@isc.sans.edu>
 
-    Date: 2026-09-01
-    Version: 1.1.0
+    Date: 2026-10-26
+    Version: 1.2.0
 
-    Perform file integrity check on Unix/Linux systems
+    Perform file integrity check on Unix/Linux systems (hashes, timestamps,
+    and, if libcap is available, file capabilities)
 
     Based loosely on the fcheck Perl script by Michael A. Gumienny
 
@@ -19,7 +20,7 @@
       -h, --help            show this help message and exit
       -c CONFIG, --config CONFIG
                             Configuration file.
-      -s SIZE, --size SIZE  max size of file to hash (default = 50M)
+      -s SIZE, --size SIZE  max size of file to hash (default = 500000000 (500M))
       -u, --update          update database
       -V, --version         print version number
       -r, --report          produce a report
@@ -27,6 +28,8 @@
 """
 
 import csv
+import ctypes
+import ctypes.util
 #import configparser
 import os
 import errno
@@ -55,8 +58,27 @@ if sys.version_info < (3, 15):
 else: 
     have_statx = True
 
-__version_info__ = (1, 1, 0)
+def load_libcap():
+    """Load libcap via ctypes and declare the prototypes we use; None if unavailable"""
+    try:
+        lib = ctypes.CDLL(ctypes.util.find_library('cap') or 'libcap.so.2', use_errno=True)
+        lib.cap_get_file.argtypes = [ctypes.c_char_p]
+        lib.cap_get_file.restype = ctypes.c_void_p
+        # c_void_p (not c_char_p) so we keep the pointer to hand back to cap_free
+        lib.cap_to_text.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.cap_to_text.restype = ctypes.c_void_p
+        lib.cap_free.argtypes = [ctypes.c_void_p]
+        lib.cap_free.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        return None
+    return lib
+
+libcap = load_libcap()
+
+__version_info__ = (1, 2, 0)
 __version__ = ".".join(map(str, __version_info__))
+# fields per db entry: path, inode, perms, links, uid, gid, size, ctime, mtime, btime, hash, caps
+NUM_FIELDS = 12
 new_db_file_path = "/run/ficheck.db.new"
 old_db_file_path = "/var/lib/ficheck/ficheck.db"
 report_file_path = "/run/ficheck.txt"
@@ -67,14 +89,35 @@ args = None
 report = None
 
 # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-arguments,line-too-long,too-many-nested-blocks
-def write_file(filepath, inode, perms, links, uid, gid, size, ctime, mtime, btime, file_hash):
+def get_caps(fname):
+    """Return the file capabilities of fname as libcap text ('' if none or libcap unavailable)"""
+    if libcap is None:
+        return ""
+    cap = libcap.cap_get_file(os.fsencode(fname))
+    if not cap:
+        # NULL with ENODATA/EOPNOTSUPP/EACCES/...: nothing to record
+        return ""
+    try:
+        text_ptr = libcap.cap_to_text(cap, None)
+        if not text_ptr:
+            return ""
+        try:
+            text = ctypes.string_at(text_ptr).decode('utf8', errors='replace')
+        finally:
+            libcap.cap_free(text_ptr)
+    finally:
+        libcap.cap_free(cap)
+    # an empty set is rendered as "="
+    return "" if text == "=" else text
+
+def write_file(filepath, inode, perms, links, uid, gid, size, ctime, mtime, btime, file_hash, caps):
     """Write entry to new db file"""
 
     # Append the new user data
     # pylint: disable=redefined-outer-name
     with open(new_db_file_path, 'a', newline='', encoding='utf8') as file:
         writer = csv.writer(file, delimiter='&')
-        writer.writerow([filepath, inode, perms, links, uid, gid, size, ctime, mtime, btime, file_hash])
+        writer.writerow([filepath, inode, perms, links, uid, gid, size, ctime, mtime, btime, file_hash, caps])
 
 def compare_files(file1_path, file2_path):
     """Compare new and old dbs"""
@@ -84,13 +127,14 @@ def compare_files(file1_path, file2_path):
     if not args.report:
         return
     def get_next_line(reader):
-        """Skip malformed lines and return valid entries"""
+        """Return the next entry, padding pre-1.2.0 (no caps column) rows"""
         try:
-            while True:
-                line = next(reader)
-                return line
+            line = next(reader)
         except StopIteration:
             return None
+        if len(line) == NUM_FIELDS - 1:
+            line.append('')
+        return line
 
     with open(file1_path, 'r', encoding='utf8') as f1, open(file2_path, 'r', encoding='utf8') as f2:
         reader1 = csv.reader(f1, delimiter='&')
@@ -135,9 +179,9 @@ def compare_files(file1_path, file2_path):
                         line2 = get_next_line(reader2)
                     continue
 
-                # Check fields 2-11 (indexes 1-10)
+                # Check fields 2-12 (indexes 1-11)
                 differences = []
-                for idx in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                for idx in range(1, NUM_FIELDS):
                     if line1[idx] != line2[idx]:
                         differences.append( (idx, line1[idx], line2[idx]) )
 
@@ -179,6 +223,8 @@ def compare_files(file1_path, file2_path):
                                 print (f"Hashes: {val1} - {val2}", end='', file = report)
                             else:
                                 print (f"Hashes: SYMLINK:{val1} - SYMLINK:{val2}", end='', file = report)
+                        elif idx == 11:
+                            print (f"Caps: {val1 or 'none'} - {val2 or 'none'}", end='', file = report)
                         if num_diff > 1:
                             print (", ", end='', file = report)
                             num_diff -= 1
@@ -187,7 +233,7 @@ def compare_files(file1_path, file2_path):
 
                 line1 = get_next_line(reader1)
                 line2 = get_next_line(reader2)
-            elif (key1 < key2 and len(line1) == 11) or len(line1) > len(line2):
+            elif (key1 < key2 and len(line1) == NUM_FIELDS) or len(line1) > len(line2):
                 changes += 1
                 time3 = strftime('%Y-%m-%d %H:%M:%S', localtime(int(line1[9])))
                 print (file = report)
@@ -197,6 +243,8 @@ def compare_files(file1_path, file2_path):
                         file = report)
                 print ("        {:<10} {:<12} {:<8} {:<8} {:<8} {:<15} {:<20}".format(line1[1],line1[2],line1[3],line1[4],line1[5],line1[6],time3),
                         file = report)
+                if line1[11]:
+                    print (f"        Caps: {line1[11]}", file = report)
                 line1 = get_next_line(reader1)
             else:
                 changes += 1
@@ -226,6 +274,8 @@ def compare_files(file1_path, file2_path):
                         file = report)
                 print ("        {:<10} {:<12} {:<8} {:<8} {:<8} {:<15} {:<20}".format(line2[1],line2[2],line2[3],line2[4],line2[5],line2[6],time3),
                         file = report)
+                if line2[11]:
+                    print (f"        Caps: {line2[11]}", file = report)
                 line2 = get_next_line(reader2)
 
         # Process remaining lines in either file
@@ -256,6 +306,8 @@ def compare_files(file1_path, file2_path):
                     file = report)
             print ("        {:<10} {:<12} {:>8} {:>8} {:>8} {:>15} {:<20}".format(line1[1],line1[2],line1[3],line1[4],line1[5],line1[6],time3),
                     file = report)
+            if line1[11]:
+                print (f"        Caps: {line1[11]}", file = report)
             line1 = get_next_line(reader1)
 
         while line2:
@@ -285,6 +337,8 @@ def compare_files(file1_path, file2_path):
                     file = report)
             print ("        {:<10} {:<12} {:>8} {:>8} {:>8} {:>15} {:<20}".format(line2[1],line2[2],line2[3],line2[4],line2[5],line2[6],time3),
                     file = report)
+            if line2[11]:
+                print (f"        Caps: {line2[11]}", file = report)
             line2 = get_next_line(reader2)
 
         if changes == 0:
@@ -324,7 +378,7 @@ def mode_to_string(mode):
             grp_mode = grp_mode.replace("x", "s")
         else:
             grp_mode = grp_mode[:1] + "S"
-    mode_str = mode_str + own_mode
+    mode_str = mode_str + grp_mode
     oth_mode = lookup[(mode & 0o7)]
     if mode & 0o1000:
         if mode & 0o1:
@@ -385,7 +439,9 @@ def process_entry(fname):
     gid = status.st_gid
     inode = status.st_ino
     links = status.st_nlink
-    write_file(fname_out, inode, mode, links, uid, gid, size, ctime, mtime, btime, sha256str)
+    # regular files only: cap_get_file follows symlinks and caps are meaningless elsewhere
+    caps = get_caps(fname) if S_ISREG(status.st_mode) else ""
+    write_file(fname_out, inode, mode, links, uid, gid, size, ctime, mtime, btime, sha256str, caps)
 
 def walk_directory_tree(dirs, paths):
     """Walk through the directories configured in config file"""
@@ -489,6 +545,9 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if libcap is None:
+        print ("Warning: libcap not found, file capabilities will not be recorded or compared reliably", file=sys.stderr)
 
     root_dirs = []
     skip_paths = []

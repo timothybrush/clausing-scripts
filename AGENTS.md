@@ -42,4 +42,6 @@ __date__ = 'YYYY-MM-DD'
 - `-u` (update): walks directories per config, writes new DB to `/run/ficheck.db.new`, moves to `/var/lib/ficheck/ficheck.db`
 - `-r` (report): compares old vs new DB and prints additions/deletions/modifications
 
+DB entries have 12 `&`-separated fields: path, inode, perms, links, uid, gid, size, ctime, mtime, btime, sha256, caps. `caps` is the libcap text form (e.g. `cap_net_raw=ep`, empty if none) read via ctypes from regular files only; if libcap can't be loaded, a warning is printed and caps are left empty. Pre-1.2.0 11-field DBs are padded with an empty `caps` when read.
+
 Config (`ficheck.cfg`) uses `Directory=` and `Exclusion=` keys; if a path appears in both, `Exclusion=` takes precedence.
